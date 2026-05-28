@@ -275,6 +275,8 @@ def authorized() -> bool:
 
 @app.before_request
 def require_password():
+    if request.path == "/health":
+        return None
     if request.path.startswith("/static"):
         return None
     if not authorized():
@@ -460,6 +462,11 @@ refresh();
 @app.get("/")
 def index():
     return render_template_string(PAGE, key=request.args.get("key", ""))
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
 
 
 @app.post("/upload")
