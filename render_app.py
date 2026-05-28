@@ -87,12 +87,13 @@ class CloudState:
                 continue
             wb = load_workbook(path, read_only=True, data_only=True)
             ws = wb.active
-            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            row_iter = ws.iter_rows(values_only=True)
+            headers = list(next(row_iter, []) or [])
             number_col = self.find_number_column(headers)
             company_col = 1
-            for row_num in range(2, ws.max_row + 1):
-                company = ws.cell(row_num, company_col).value
-                original = ws.cell(row_num, number_col).value
+            for row_num, values in enumerate(row_iter, start=2):
+                company = values[company_col - 1] if len(values) >= company_col else ""
+                original = values[number_col - 1] if len(values) >= number_col else ""
                 clean = normalize_number(original)
                 rows.append(
                     {
