@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: telkom-manual-checker
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn render_app:app
+    plan: free
+    envVars:
+      - key: DATA_DIR
+        value: /tmp/telkom-render-checker
+      - key: SECRET_KEY
+        generateValue: true
+      - key: APP_PASSWORD
+        generateValue: true
