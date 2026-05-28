@@ -4,6 +4,7 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn render_app:app
+    healthCheckPath: /health
     plan: free
     envVars:
       - key: DATA_DIR
