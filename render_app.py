@@ -24,6 +24,7 @@ from telkom_batch_check import (
     is_supported_number,
     load_cache,
     normalize_number,
+    parse_result,
     provider_is_telkom,
     query_number,
     save_cache,
@@ -49,6 +50,7 @@ class CloudState:
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
         self.client = CrdbClient(timeout=45)
         self.cache = load_cache(CACHE_PATH)
+        self.pending_captcha: dict[str, dict[str, str]] = {}
         self.files: list[dict[str, str]] = []
         self.rows: list[dict[str, Any]] = []
         self.job_lock = threading.Lock()
@@ -76,6 +78,7 @@ class CloudState:
     def reset(self) -> None:
         self.files = []
         self.rows = []
+        self.pending_captcha = {}
         for pattern in ("*.xlsx", "*.csv"):
             for path in UPLOAD_DIR.glob(pattern):
                 path.unlink(missing_ok=True)
@@ -314,6 +317,12 @@ class CloudState:
                             f"{clean_number}: {result.get('current_provider') or 'Unknown'} "
                             f"({result.get('telkom') or 'Unknown'})"
                         )
+                    elif result_data.get("kind") == "captcha":
+                        self.auto_job["blocked"] = True
+                        self.auto_job["last_message"] = (
+                            f"Paused at {clean_number}: type the captcha shown, then resume auto-checking."
+                        )
+                        break
                     else:
                         self.auto_job["blocked"] = True
                         self.auto_job["last_message"] = (
@@ -335,15 +344,53 @@ class CloudState:
         if result.lookup_status == "Found":
             self.save_result(result)
             return {"kind": "found", "result": asdict(result)}
-        message = "Endpoint lookup did not return a confirmed provider. Use the public form fallback, then save the visible provider here."
         if result.lookup_status == "Captcha required":
-            message = "The Porting site requested verification. Open the public Porting form, complete the page there if needed, then save the visible provider here."
+            return self.new_captcha(clean_number)
+        message = "Endpoint lookup did not return a confirmed provider. Use the public form fallback, then save the visible provider here."
         return {
             "kind": "manual",
             "number": clean_number,
             "formUrl": self.porting_lookup_url(clean_number),
             "result": asdict(result),
             "message": message,
+        }
+
+    def new_captcha(self, clean_number: str) -> dict[str, Any]:
+        response = self.client.request("GET", "captcha/captcha-gen")
+        image_data = str(response.get("imageData") or "")
+        string_data = str(response.get("stringData") or "")
+        self.pending_captcha[clean_number] = {"captchaEncrypt": string_data}
+        return {
+            "kind": "captcha",
+            "number": clean_number,
+            "imageData": image_data,
+            "message": "The Porting site requested captcha verification. Type the captcha shown, then continue automatic checking.",
+        }
+
+    def submit_captcha(self, clean_number: str, code: str) -> dict[str, Any]:
+        pending = self.pending_captcha.get(clean_number)
+        if not pending:
+            return self.new_captcha(clean_number)
+        payload = {
+            "number": clean_number,
+            "captcha": code.strip(),
+            "captchaEncrypt": pending["captchaEncrypt"],
+            "puid": self.client.puid,
+        }
+        response = self.client.request("POST", "publicInquiry/submitRequest", payload)
+        result = parse_result(clean_number, response)
+        if result.lookup_status == "Captcha required":
+            return self.new_captcha(clean_number)
+        self.pending_captcha.pop(clean_number, None)
+        if result.lookup_status == "Found":
+            self.save_result(result)
+            return {"kind": "found", "result": asdict(result)}
+        return {
+            "kind": "manual",
+            "number": clean_number,
+            "formUrl": self.porting_lookup_url(clean_number),
+            "result": asdict(result),
+            "message": "Captcha was accepted, but no confirmed provider came back. Use the Porting form link and save the provider manually.",
         }
 
     def save_manual_result(self, clean_number: str, provider: str, raw_result: str = "") -> dict[str, Any]:
@@ -601,7 +648,8 @@ PAGE = """
     .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
     .result { padding: 12px; border-radius: 6px; margin-top: 14px; background: #eef3ff; white-space: pre-wrap; }
     .yes { background: #d9ead3; } .no { background: #f4cccc; } .unknown { background: #ffe699; }
-    .manual { display: none; margin-top: 14px; padding: 14px; border: 1px solid #d7b945; background: #fff7d6; border-radius: 8px; }
+    .manual, .captcha { display: none; margin-top: 14px; padding: 14px; border: 1px solid #d7b945; background: #fff7d6; border-radius: 8px; }
+    .captcha img { display: block; max-width: 260px; border: 1px solid #d0d0d0; background: white; margin-bottom: 10px; }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
     th, td { text-align: left; border-bottom: 1px solid #e5e7eb; padding: 8px; vertical-align: top; }
     th { background: #eef2f7; }
@@ -645,6 +693,14 @@ PAGE = """
       <button class="secondary" id="skipBtn">Skip For Now</button>
     </div>
     <div id="jobStatus" class="result"></div>
+    <div class="captcha" id="captchaBox">
+      <div class="label">Captcha from Porting site</div>
+      <img id="captchaImg" alt="Captcha">
+      <div class="actions">
+        <input id="captchaInput" autocomplete="off" placeholder="Type captcha code">
+        <button id="captchaBtn">Submit Captcha</button>
+      </div>
+    </div>
     <div class="manual" id="manualBox">
       <div class="label">Manual form result</div>
       <div class="actions">
@@ -700,8 +756,8 @@ function renderJob(job) {
   box.textContent = `Automatic checker: ${running}\\nChecked this run: ${job.checked_now || 0}\\nLast number: ${job.last_number || '-'}\\n${job.last_message || ''}`;
 }
 function renderCurrent(row) {
-  current = row; document.getElementById('manualBox').style.display = 'none';
-  document.getElementById('manualProvider').value = ''; document.getElementById('manualRaw').value = '';
+  current = row; document.getElementById('manualBox').style.display = 'none'; document.getElementById('captchaBox').style.display = 'none';
+  document.getElementById('manualProvider').value = ''; document.getElementById('manualRaw').value = ''; document.getElementById('captchaInput').value = '';
   if (!row) {
     document.getElementById('company').textContent = 'No unchecked row available';
     document.getElementById('number').textContent = ''; document.getElementById('numberType').textContent = ''; document.getElementById('area').textContent = '';
@@ -726,6 +782,14 @@ function showManual(data) {
   document.getElementById('manualBox').style.display = 'block';
   document.getElementById('result').textContent += '\\n\\n' + data.message;
 }
+function showCaptcha(data) {
+  document.getElementById('captchaBox').style.display = 'block';
+  document.getElementById('manualBox').style.display = 'none';
+  document.getElementById('captchaImg').src = 'data:image/jpeg;base64,' + data.imageData;
+  document.getElementById('result').className = 'result unknown';
+  document.getElementById('result').textContent = data.message;
+  document.getElementById('captchaInput').focus();
+}
 async function refresh() {
   const data = await api('/api/state');
   renderSummary(data.summary); renderCurrent(data.next); renderRecent(data.recent);
@@ -734,7 +798,9 @@ async function checkCurrent() {
   if (!current || busy) return; setBusy(true);
   try {
     const data = await api('/api/check', { number: current.clean_number });
-    if (data.kind === 'manual') {
+    if (data.kind === 'captcha') {
+      showCaptcha(data);
+    } else if (data.kind === 'manual') {
       showManual(data);
     } else { showResult(data.result); await refresh(); }
   } finally { setBusy(false); }
@@ -758,6 +824,26 @@ function openForm() {
   const url = number ? formBase + '&msisdn=' + encodeURIComponent(number) : formBase;
   window.open(url, '_blank', 'noopener');
 }
+async function submitCaptcha() {
+  if (!current || busy) return;
+  const code = document.getElementById('captchaInput').value.trim();
+  if (!code) return;
+  setBusy(true);
+  try {
+    const data = await api('/api/captcha', { number: current.clean_number, code });
+    if (data.kind === 'captcha') {
+      showCaptcha(data);
+      document.getElementById('result').textContent = 'That code was not accepted. Try the new captcha.';
+    } else if (data.kind === 'manual') {
+      document.getElementById('captchaBox').style.display = 'none';
+      showManual(data);
+    } else {
+      document.getElementById('captchaBox').style.display = 'none';
+      showResult(data.result);
+      await refresh();
+    }
+  } finally { setBusy(false); }
+}
 async function saveManual() {
   if (!current || busy) return;
   const provider = document.getElementById('manualProvider').value.trim();
@@ -777,7 +863,9 @@ document.getElementById('checkBtn').addEventListener('click', checkCurrent);
 document.getElementById('autoBtn').addEventListener('click', startAuto);
 document.getElementById('stopAutoBtn').addEventListener('click', stopAuto);
 document.getElementById('formBtn').addEventListener('click', openForm);
+document.getElementById('captchaBtn').addEventListener('click', submitCaptcha);
 document.getElementById('manualBtn').addEventListener('click', saveManual);
+document.getElementById('captchaInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitCaptcha(); });
 document.getElementById('manualProvider').addEventListener('keydown', e => { if (e.key === 'Enter') saveManual(); });
 document.getElementById('skipBtn').addEventListener('click', refresh);
 document.getElementById('resetBtn').addEventListener('click', async () => { if (confirm('Remove uploaded files from this cloud app?')) { await api('/api/reset', {}); await refresh(); } });
@@ -837,6 +925,12 @@ def api_auto_start():
 @app.post("/api/auto-stop")
 def api_auto_stop():
     return jsonify({"job": STATE.stop_auto_check()})
+
+
+@app.post("/api/captcha")
+def api_captcha():
+    data = request.get_json(force=True)
+    return jsonify(STATE.submit_captcha(str(data.get("number") or ""), str(data.get("code") or "")))
 
 
 @app.post("/api/manual-result")
