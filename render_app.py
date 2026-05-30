@@ -74,8 +74,12 @@ class CloudState:
 
     def load_state(self) -> None:
         if STATE_PATH.exists():
-            raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            self.files = raw.get("files", [])
+            try:
+                raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+                self.files = raw.get("files", [])
+            except json.JSONDecodeError:
+                self.files = []
+                STATE_PATH.unlink(missing_ok=True)
         self.rows = self.load_rows()
 
     def save_state(self) -> None:
@@ -83,7 +87,11 @@ class CloudState:
 
     def load_api_jobs(self) -> None:
         if JOBS_PATH.exists():
-            self.api_jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
+            try:
+                self.api_jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                self.api_jobs = {}
+                JOBS_PATH.unlink(missing_ok=True)
 
     def save_api_jobs(self) -> None:
         JOBS_PATH.write_text(json.dumps(self.api_jobs, indent=2), encoding="utf-8")
@@ -1186,9 +1194,14 @@ function renderJob(job) {
   box.className = 'result ' + (job.blocked ? 'unknown' : '');
   box.textContent = `Automatic checker: ${running}\\nChecked this run: ${job.checked_now || 0}\\nLast number: ${job.last_number || '-'}\\n${job.last_message || ''}`;
 }
-function renderCurrent(row) {
-  current = row; document.getElementById('manualBox').style.display = 'none'; document.getElementById('captchaBox').style.display = 'none'; captchaNumber = '';
-  document.getElementById('manualProvider').value = ''; document.getElementById('manualRaw').value = ''; document.getElementById('captchaInput').value = '';
+function renderCurrent(row, keepCaptcha = false) {
+  current = row; document.getElementById('manualBox').style.display = 'none';
+  if (!keepCaptcha) {
+    document.getElementById('captchaBox').style.display = 'none';
+    captchaNumber = '';
+    document.getElementById('captchaInput').value = '';
+  }
+  document.getElementById('manualProvider').value = ''; document.getElementById('manualRaw').value = '';
   if (!row) {
     document.getElementById('company').textContent = 'No unchecked row available';
     document.getElementById('number').textContent = ''; document.getElementById('numberType').textContent = ''; document.getElementById('area').textContent = '';
@@ -1224,7 +1237,7 @@ function showCaptcha(data) {
 }
 async function refresh() {
   const data = await api('/api/state');
-  renderSummary(data.summary); renderCurrent(data.next); renderRecent(data.recent);
+  renderSummary(data.summary); renderCurrent(data.next, Boolean(data.pending_captcha)); renderRecent(data.recent);
   if (data.pending_captcha) showCaptcha(data.pending_captcha);
 }
 async function checkCurrent() {
