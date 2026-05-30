@@ -21,12 +21,39 @@ CRDB_REST_URL = "https://www.porting.co.za/PublicWebsiteApp/rest/"
 USER_AGENT = "Mozilla/5.0 (compatible; TelkomBatchChecker/1.0)"
 RESULT_HEADERS = [
     "Clean Number",
+    "Number Type",
     "Lookup Status",
     "Current Provider",
-    "Telkom?",
+    "Telkom Service?",
     "Raw Result",
     "Checked At",
 ]
+
+MOBILE_PREFIXES = {
+    "060",
+    "061",
+    "062",
+    "063",
+    "064",
+    "065",
+    "066",
+    "067",
+    "068",
+    "069",
+    "071",
+    "072",
+    "073",
+    "074",
+    "076",
+    "078",
+    "079",
+    "081",
+    "082",
+    "083",
+    "084",
+}
+
+TELKOM_PROVIDER_CODES = {"TELKOM", "TELKMOBL", "TELKOMMOBILE"}
 
 
 @dataclass
@@ -85,6 +112,23 @@ def normalize_number(value: Any) -> str:
     return digits
 
 
+def classify_number(clean_number: str) -> str:
+    if not re.fullmatch(r"0\d{9}", clean_number or ""):
+        return ""
+    prefix = clean_number[:3]
+    if prefix == "011":
+        return "Johannesburg 011"
+    if prefix == "012":
+        return "Tshwane 012"
+    if prefix in MOBILE_PREFIXES:
+        return "Mobile"
+    return ""
+
+
+def is_supported_number(clean_number: str) -> bool:
+    return bool(classify_number(clean_number))
+
+
 class CrdbClient:
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
@@ -129,7 +173,10 @@ class CrdbClient:
 
 def provider_is_telkom(provider: str) -> bool:
     parts = [part.strip().upper() for part in provider.split("/") if part.strip()]
-    return bool(parts) and all(part == "TELKOM" for part in parts)
+    if not parts:
+        return False
+    normalized_parts = [re.sub(r"[^A-Z0-9]", "", part) for part in parts]
+    return all(part in TELKOM_PROVIDER_CODES or part.startswith("TELKOM") for part in normalized_parts)
 
 
 def parse_result(clean_number: str, response_data: dict[str, Any]) -> LookupResult:
@@ -349,6 +396,7 @@ def process_workbook(
 
         values = [
             result.clean_number,
+            classify_number(result.clean_number),
             result.lookup_status,
             result.current_provider,
             result.telkom,
