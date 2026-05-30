@@ -18,16 +18,14 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from werkzeug.utils import secure_filename
 
+from lookup_providers import LookupProvider, build_lookup_provider
 from telkom_batch_check import (
-    CrdbClient,
     LookupResult,
     classify_number,
     is_supported_number,
     load_cache,
     normalize_number,
-    parse_result,
     provider_is_telkom,
-    query_number,
     save_cache,
 )
 
@@ -51,7 +49,7 @@ class CloudState:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        self.client = CrdbClient(timeout=45)
+        self.lookup_provider: LookupProvider = build_lookup_provider()
         self.cache = load_cache(CACHE_PATH)
         self.pending_captcha: dict[str, dict[str, str]] = {}
         self.files: list[dict[str, str]] = []
@@ -282,6 +280,7 @@ class CloudState:
             area_counts[area] = area_counts.get(area, 0) + 1
         return {
             "files": len(self.files),
+            "lookup_provider": self.lookup_provider.name,
             "total_rows": len(self.rows),
             "unique_numbers": len(unique_numbers),
             "checked_rows": len(checked_rows),
@@ -467,7 +466,7 @@ class CloudState:
     def check_number(self, clean_number: str) -> dict[str, Any]:
         if clean_number in self.cache:
             return {"kind": "found", "result": asdict(self.cache[clean_number])}
-        result = query_number(self.client, clean_number)
+        result = self.lookup_provider.lookup(clean_number)
         if result.lookup_status == "Found":
             self.save_result(result)
             return {"kind": "found", "result": asdict(result)}
@@ -483,10 +482,29 @@ class CloudState:
         }
 
     def new_captcha(self, clean_number: str) -> dict[str, Any]:
-        response = self.client.request("GET", "captcha/captcha-gen")
-        image_data = str(response.get("imageData") or "")
-        string_data = str(response.get("stringData") or "")
-        self.pending_captcha[clean_number] = {"captchaEncrypt": string_data, "imageData": image_data}
+        if not self.lookup_provider.supports_captcha:
+            return {
+                "kind": "manual",
+                "number": clean_number,
+                "formUrl": self.porting_lookup_url(clean_number),
+                "result": asdict(
+                    LookupResult(
+                        clean_number,
+                        "Needs review",
+                        "",
+                        "Unknown",
+                        "The configured lookup provider does not support captcha submission.",
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                ),
+                "message": "Manual verification is required for this number.",
+            }
+        challenge = self.lookup_provider.new_captcha(clean_number)
+        image_data = challenge.get("imageData", "")
+        self.pending_captcha[clean_number] = {
+            "captchaEncrypt": challenge.get("captchaEncrypt", ""),
+            "imageData": image_data,
+        }
         return {
             "kind": "captcha",
             "number": clean_number,
@@ -507,14 +525,7 @@ class CloudState:
         pending = self.pending_captcha.get(clean_number)
         if not pending:
             return self.new_captcha(clean_number)
-        payload = {
-            "number": clean_number,
-            "captcha": code.strip(),
-            "captchaEncrypt": pending["captchaEncrypt"],
-            "puid": self.client.puid,
-        }
-        response = self.client.request("POST", "publicInquiry/submitRequest", payload)
-        result = parse_result(clean_number, response)
+        result = self.lookup_provider.submit_captcha(clean_number, code, pending)
         if result.lookup_status == "Captcha required":
             return self.new_captcha(clean_number)
         self.pending_captcha.pop(clean_number, None)
