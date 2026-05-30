@@ -342,11 +342,13 @@ def process_workbook(
     limit: int | None = None,
     cache_only: bool = False,
 ) -> dict[str, int]:
+    from lookup_providers import build_lookup_provider
+
     wb = load_workbook(input_path)
     ws = wb.active
     number_col = find_number_column(ws)
     first_result_col = append_result_headers(ws)
-    client = CrdbClient()
+    provider = build_lookup_provider()
     captcha_blocked = False
 
     stats = {
@@ -380,7 +382,7 @@ def process_workbook(
         elif captcha_blocked:
             result = unchecked_result(clean_number, "Not checked because the public lookup requested captcha verification earlier in this run.")
         else:
-            result = query_number(client, clean_number)
+            result = provider.lookup(clean_number)
             if result.lookup_status == "Captcha required":
                 captcha_blocked = True
             else:
