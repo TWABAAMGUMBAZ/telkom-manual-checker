@@ -145,6 +145,15 @@ class CloudState:
                 return idx
         return 1
 
+    @staticmethod
+    def find_address_column(headers: list[Any]) -> int | None:
+        address_terms = {"address", "physical address", "street address", "street", "suburb", "area", "city", "location"}
+        for idx, header in enumerate(headers, start=1):
+            text = str(header or "").strip().lower()
+            if text in address_terms or "address" in text or text in {"suburb", "area"}:
+                return idx
+        return None
+
     def iter_source_rows(self, item: dict[str, str]) -> list[dict[str, Any]]:
         path = Path(item["path"])
         suffix = path.suffix.lower()
@@ -160,6 +169,7 @@ class CloudState:
             headers = list(next(row_iter, []) or [])
             number_cols = self.find_number_columns(headers)
             company_col = self.find_company_column(headers)
+            address_col = self.find_address_column(headers)
             rows = []
             for row_num, values in enumerate(row_iter, start=2):
                 rows.append(
@@ -169,6 +179,7 @@ class CloudState:
                         "values": list(values or []),
                         "number_cols": number_cols,
                         "company_col": company_col,
+                        "address_col": address_col,
                     }
                 )
             return rows
@@ -190,6 +201,7 @@ class CloudState:
         headers = rows[0]
         number_cols = self.find_number_columns(headers)
         company_col = self.find_company_column(headers)
+        address_col = self.find_address_column(headers)
         return [
             {
                 "row": idx,
@@ -197,6 +209,7 @@ class CloudState:
                 "values": values,
                 "number_cols": number_cols,
                 "company_col": company_col,
+                "address_col": address_col,
             }
             for idx, values in enumerate(rows[1:], start=2)
         ]
@@ -205,7 +218,9 @@ class CloudState:
         values = source_row["values"]
         headers = source_row["headers"]
         company_col = source_row["company_col"]
+        address_col = source_row.get("address_col")
         company = values[company_col - 1] if len(values) >= company_col else ""
+        address = values[address_col - 1] if address_col and len(values) >= address_col else ""
         extracted: list[dict[str, Any]] = []
         seen_numbers: set[str] = set()
         for number_col in source_row["number_cols"]:
@@ -221,13 +236,28 @@ class CloudState:
                     "source": item["path"],
                     "row": source_row["row"],
                     "company": company or "",
+                    "address": address or "",
                     "source_column": str(header or "Number"),
                     "original_number": original or "",
                     "clean_number": clean,
                     "number_type": classify_number(clean),
+                    "visit_area": self.derive_visit_area(address, item["label"], classify_number(clean)),
                 }
             )
         return extracted
+
+    @staticmethod
+    def derive_visit_area(address: Any, source_label: str, number_type: str) -> str:
+        text = str(address or "").strip()
+        if text:
+            parts = [part.strip() for part in text.replace("\n", ",").split(",") if part.strip()]
+            if parts:
+                return parts[-1][:80]
+        if "Tshwane" in number_type:
+            return "Tshwane / Pretoria"
+        if "Johannesburg" in number_type:
+            return "Johannesburg"
+        return source_label
 
     def summary(self) -> dict[str, Any]:
         checked_numbers = {number for number, result in self.cache.items() if result.lookup_status == "Found"}
@@ -235,6 +265,11 @@ class CloudState:
         telkom_rows = [row for row in checked_rows if self.cache[row["clean_number"]].telkom == "Yes"]
         non_telkom_rows = [row for row in checked_rows if self.cache[row["clean_number"]].telkom == "No"]
         unique_numbers = {row["clean_number"] for row in self.rows if row["clean_number"]}
+        plans = [self.lead_plan(row, self.cache.get(row["clean_number"])) for row in self.rows]
+        area_counts: dict[str, int] = {}
+        for row in self.rows:
+            area = row.get("visit_area") or row.get("area") or "Unassigned"
+            area_counts[area] = area_counts.get(area, 0) + 1
         return {
             "files": len(self.files),
             "total_rows": len(self.rows),
@@ -247,6 +282,13 @@ class CloudState:
             "joburg_rows": sum(1 for row in self.rows if row.get("number_type") == "Johannesburg 011"),
             "tshwane_rows": sum(1 for row in self.rows if row.get("number_type") == "Tshwane 012"),
             "mobile_rows": sum(1 for row in self.rows if row.get("number_type") == "Mobile"),
+            "hot_leads": sum(1 for plan in plans if plan["priority"] == "Hot"),
+            "warm_leads": sum(1 for plan in plans if plan["priority"] == "Warm"),
+            "cold_leads": sum(1 for plan in plans if plan["priority"] == "Cold"),
+            "top_visit_areas": [
+                {"area": area, "count": count}
+                for area, count in sorted(area_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+            ],
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "auto_job": dict(self.auto_job),
         }
@@ -272,9 +314,70 @@ class CloudState:
                     "telkom": result.telkom,
                     "raw": result.raw_result,
                     "number_type": row.get("number_type", ""),
+                    **self.lead_plan(row, result),
                 }
             )
         return items[-limit:]
+
+    def lead_plan(self, row: dict[str, Any], result: LookupResult | None) -> dict[str, Any]:
+        score = 0
+        reasons: list[str] = []
+        provider = result.current_provider if result else ""
+        telkom = result.telkom if result else "Unknown"
+        number_type = row.get("number_type", "")
+
+        if telkom == "Yes":
+            score += 45
+            reasons.append("Confirmed Telkom-service lead")
+        elif telkom == "No":
+            score += 35
+            reasons.append(f"Competitor/provider opportunity: {provider}")
+        elif result and result.lookup_status != "Found":
+            score += 10
+            reasons.append("Needs verification before field visit")
+        else:
+            score += 5
+            reasons.append("Pending provider check")
+
+        if number_type in {"Johannesburg 011", "Tshwane 012"}:
+            score += 20
+            reasons.append("Fixed-line business area")
+        elif number_type == "Mobile":
+            score += 8
+            reasons.append("Mobile contact")
+
+        if row.get("address"):
+            score += 15
+            reasons.append("Physical address available")
+        if row.get("company"):
+            score += 10
+            reasons.append("Company name available")
+
+        priority = "Cold"
+        if score >= 70:
+            priority = "Hot"
+        elif score >= 45:
+            priority = "Warm"
+
+        if telkom == "Yes":
+            action = "Visit first: confirm service, upsell, retain, or expand account."
+        elif telkom == "No":
+            action = "Visit for competitor conversion opportunity."
+        elif result and result.lookup_status != "Found":
+            action = "Verify provider manually before assigning a field visit."
+        else:
+            action = "Complete lookup before route planning."
+
+        return {
+            "lead_score": score,
+            "priority": priority,
+            "visit_area": row.get("visit_area") or row.get("area") or "Unassigned",
+            "assigned_rep": "",
+            "visit_status": "Not visited",
+            "visit_notes": "",
+            "next_action": action,
+            "score_reason": "; ".join(reasons),
+        }
 
     def save_result(self, result: LookupResult) -> None:
         if result.lookup_status == "Found":
@@ -571,6 +674,8 @@ class CloudState:
             outputs.append({"label": output.name, "url": url_for("download_report", filename=output.name)})
         telkom = self.export_telkom_only()
         outputs.append({"label": telkom.name, "url": url_for("download_report", filename=telkom.name)})
+        route = self.export_daily_route_plan()
+        outputs.append({"label": route.name, "url": url_for("download_report", filename=route.name)})
         return {"outputs": outputs}
 
     def result_for_export(self, clean_number: str) -> LookupResult:
@@ -607,6 +712,15 @@ class CloudState:
             "Raw Result",
             "Checked At",
             "Porting Lookup Link",
+            "Lead Priority Score",
+            "Lead Priority",
+            "Visit Area",
+            "Suggested Visit Order",
+            "Assigned Rep",
+            "Visit Status",
+            "Visit Notes",
+            "Next Action",
+            "Score Reason",
         ]
 
         wb = Workbook()
@@ -619,10 +733,11 @@ class CloudState:
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         out_row = 2
+        order_map = self.suggested_order_map([row for row in self.rows if row["source"] == item["path"]])
         for source_row in source_rows:
             extracted = self.extract_phone_rows(item, source_row)
             if not extracted:
-                self.write_report_row(ws, out_row, source_row["values"], len(headers), "", "", self.result_for_export(""))
+                self.write_report_row(ws, out_row, source_row["values"], len(headers), "", "", self.result_for_export(""), {}, "")
                 out_row += 1
                 continue
             for phone_row in extracted:
@@ -635,6 +750,8 @@ class CloudState:
                     phone_row["clean_number"],
                     phone_row["number_type"],
                     result,
+                    phone_row,
+                    order_map.get((phone_row["source"], phone_row["row"], phone_row["clean_number"]), ""),
                 )
                 out_row += 1
 
@@ -651,6 +768,8 @@ class CloudState:
         clean_number: str,
         number_type: str,
         result: LookupResult,
+        phone_row: dict[str, Any],
+        suggested_order: Any,
     ) -> None:
         for col, value in enumerate(values, start=1):
             ws.cell(out_row, col, value)
@@ -665,9 +784,23 @@ class CloudState:
             result.checked_at,
             self.porting_lookup_url(clean_number or result.clean_number),
         ]
+        plan = self.lead_plan(phone_row, result)
+        export_values.extend(
+            [
+                plan["lead_score"],
+                plan["priority"],
+                plan["visit_area"],
+                suggested_order,
+                plan["assigned_rep"],
+                plan["visit_status"],
+                plan["visit_notes"],
+                plan["next_action"],
+                plan["score_reason"],
+            ]
+        )
         for offset, value in enumerate(export_values):
             cell = ws.cell(out_row, first_result_col + offset, value)
-            if offset == len(export_values) - 1 and clean_number:
+            if offset == 7 and clean_number:
                 cell.hyperlink = value
                 cell.style = "Hyperlink"
         self.style_export_row(ws, out_row, first_result_col, result.telkom, len(export_values))
@@ -694,6 +827,46 @@ class CloudState:
             max_len = max(len(str(ws.cell(row, col).value or "")) for row in range(1, min(ws.max_row, 120) + 1))
             ws.column_dimensions[get_column_letter(col)].width = min(max(max_len + 2, 10), 58)
 
+    def suggested_order_map(self, rows: list[dict[str, Any]]) -> dict[tuple[str, int, str], int]:
+        unique_rows: dict[tuple[str, int, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (row["source"], row["row"], row["clean_number"])
+            unique_rows.setdefault(key, row)
+        ranked = sorted(
+            unique_rows.items(),
+            key=lambda item: (
+                -self.lead_plan(item[1], self.cache.get(item[1]["clean_number"]))["lead_score"],
+                self.lead_plan(item[1], self.cache.get(item[1]["clean_number"]))["visit_area"],
+                item[1].get("company", ""),
+            ),
+        )
+        return {key: index for index, (key, _row) in enumerate(ranked, start=1)}
+
+    def planning_rows(self) -> list[dict[str, Any]]:
+        seen: set[tuple[str, int, str]] = set()
+        rows: list[dict[str, Any]] = []
+        order_map = self.suggested_order_map(self.rows)
+        for row in self.rows:
+            key = (row["source"], row["row"], row["clean_number"])
+            if key in seen:
+                continue
+            seen.add(key)
+            result = self.result_for_export(row["clean_number"])
+            plan = self.lead_plan(row, result)
+            rows.append(
+                {
+                    **row,
+                    "provider": result.current_provider,
+                    "telkom": result.telkom,
+                    "lookup_status": result.lookup_status,
+                    "raw_result": result.raw_result,
+                    "checked_at": result.checked_at,
+                    "suggested_order": order_map.get(key, ""),
+                    **plan,
+                }
+            )
+        return sorted(rows, key=lambda row: (row["suggested_order"] or 999999))
+
     def export_telkom_only(self) -> Path:
         output = REPORT_DIR / "telkom_companies_only.xlsx"
         out_wb = Workbook()
@@ -702,10 +875,19 @@ class CloudState:
         headers = [
             "Source File",
             "Company",
+            "Address",
             "Original Number",
             "Clean Number",
             "Number Type",
             "Current Provider",
+            "Lead Priority Score",
+            "Lead Priority",
+            "Visit Area",
+            "Suggested Visit Order",
+            "Assigned Rep",
+            "Visit Status",
+            "Visit Notes",
+            "Next Action",
             "Raw Result",
             "Checked At",
             "Porting Lookup Link",
@@ -718,6 +900,7 @@ class CloudState:
 
         out_row = 2
         seen_rows: set[tuple[str, int, str]] = set()
+        order_map = self.suggested_order_map(self.rows)
         for item in self.files:
             for phone_row in [row for row in self.rows if row["source"] == item["path"]]:
                 key = (phone_row["source"], phone_row["row"], phone_row["clean_number"])
@@ -727,13 +910,23 @@ class CloudState:
                 result = self.cache.get(phone_row["clean_number"])
                 if not result or result.telkom != "Yes":
                     continue
+                plan = self.lead_plan(phone_row, result)
                 values = [
                     item["label"],
                     phone_row.get("company", ""),
+                    phone_row.get("address", ""),
                     phone_row.get("original_number", ""),
                     result.clean_number,
                     phone_row.get("number_type", classify_number(result.clean_number)),
                     result.current_provider,
+                    plan["lead_score"],
+                    plan["priority"],
+                    plan["visit_area"],
+                    order_map.get(key, ""),
+                    plan["assigned_rep"],
+                    plan["visit_status"],
+                    plan["visit_notes"],
+                    plan["next_action"],
                     result.raw_result,
                     result.checked_at,
                     self.porting_lookup_url(result.clean_number),
@@ -751,6 +944,72 @@ class CloudState:
                 out_ws.cell(row, col).alignment = Alignment(vertical="top", wrap_text=True)
         self.finish_workbook(out_ws)
         out_wb.save(output)
+        return output
+
+    def export_daily_route_plan(self) -> Path:
+        output = REPORT_DIR / "daily_visit_route_plan.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Daily Route Plan"
+        headers = [
+            "Suggested Visit Order",
+            "Lead Priority",
+            "Lead Priority Score",
+            "Visit Area",
+            "Company",
+            "Address",
+            "Original Number",
+            "Clean Number",
+            "Number Type",
+            "Current Provider",
+            "Telkom Service?",
+            "Lookup Status",
+            "Assigned Rep",
+            "Visit Status",
+            "Visit Notes",
+            "Next Action",
+            "Score Reason",
+            "Porting Lookup Link",
+        ]
+        for col, header in enumerate(headers, start=1):
+            cell = ws.cell(1, col, header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for out_row, row in enumerate(self.planning_rows(), start=2):
+            values = [
+                row["suggested_order"],
+                row["priority"],
+                row["lead_score"],
+                row["visit_area"],
+                row.get("company", ""),
+                row.get("address", ""),
+                row.get("original_number", ""),
+                row.get("clean_number", ""),
+                row.get("number_type", ""),
+                row.get("provider", ""),
+                row.get("telkom", ""),
+                row.get("lookup_status", ""),
+                row["assigned_rep"],
+                row["visit_status"],
+                row["visit_notes"],
+                row["next_action"],
+                row["score_reason"],
+                self.porting_lookup_url(row.get("clean_number", "")),
+            ]
+            for col, value in enumerate(values, start=1):
+                cell = ws.cell(out_row, col, value)
+                if col == len(values):
+                    cell.hyperlink = value
+                    cell.style = "Hyperlink"
+            plan_fill = PatternFill("solid", fgColor="C6EFCE" if row["priority"] == "Hot" else "FFF2CC" if row["priority"] == "Warm" else "E7E6E6")
+            for col in range(1, len(values) + 1):
+                ws.cell(out_row, col).fill = plan_fill
+                ws.cell(out_row, col).alignment = Alignment(vertical="top", wrap_text=True)
+
+        self.finish_workbook(ws)
+        wb.save(output)
         return output
 
 
@@ -839,6 +1098,10 @@ PAGE = """
   </section>
 
   <section class="grid" id="summary"></section>
+  <section class="panel">
+    <h2>Field Planning</h2>
+    <div id="planningSummary" class="result"></div>
+  </section>
 
   <section class="panel">
     <div class="row-title">
@@ -877,7 +1140,7 @@ PAGE = """
   <section class="panel">
     <h2>Recent Checked Rows</h2>
     <table>
-      <thead><tr><th>File</th><th>Company</th><th>Number</th><th>Type</th><th>Provider</th><th>Telkom Service?</th></tr></thead>
+      <thead><tr><th>File</th><th>Company</th><th>Number</th><th>Type</th><th>Provider</th><th>Telkom Service?</th><th>Priority</th><th>Visit Area</th><th>Next Action</th></tr></thead>
       <tbody id="recent"></tbody>
     </table>
   </section>
@@ -907,8 +1170,11 @@ function renderSummary(summary) {
     metric('Files', summary.files), metric('Queue rows', summary.total_rows), metric('Unique numbers', summary.unique_numbers),
     metric('Checked', summary.checked_rows), metric('Remaining', summary.remaining_rows), metric('Telkom', summary.telkom_rows),
     metric('011 rows', summary.joburg_rows), metric('012 rows', summary.tshwane_rows), metric('Mobile rows', summary.mobile_rows),
-    metric('Non-Telkom', summary.non_telkom_rows)
+    metric('Non-Telkom', summary.non_telkom_rows), metric('Hot leads', summary.hot_leads), metric('Warm leads', summary.warm_leads),
+    metric('Cold leads', summary.cold_leads)
   ].join('');
+  const areas = (summary.top_visit_areas || []).map(item => `${item.area}: ${item.count}`).join('\\n') || 'No visit areas yet.';
+  document.getElementById('planningSummary').textContent = `Top visit areas\\n${areas}\\n\\nExport reports to get daily_visit_route_plan.xlsx sorted by suggested visit order.`;
   renderJob(summary.auto_job || {});
 }
 function renderJob(job) {
@@ -932,7 +1198,7 @@ function renderCurrent(row) {
 }
 function renderRecent(rows) {
   document.getElementById('recent').innerHTML = rows.slice().reverse().map(row => `
-    <tr><td>${esc(row.area)}</td><td>${esc(row.company)}</td><td>${esc(row.clean_number)}</td><td>${esc(row.number_type)}</td><td>${esc(row.provider)}</td><td>${esc(row.telkom)}</td></tr>`).join('');
+    <tr><td>${esc(row.area)}</td><td>${esc(row.company)}</td><td>${esc(row.clean_number)}</td><td>${esc(row.number_type)}</td><td>${esc(row.provider)}</td><td>${esc(row.telkom)}</td><td>${esc(row.priority)}</td><td>${esc(row.visit_area)}</td><td>${esc(row.next_action)}</td></tr>`).join('');
 }
 function showResult(result) {
   const box = document.getElementById('result');
