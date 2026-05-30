@@ -91,6 +91,7 @@ class CloudState:
     def reset(self) -> None:
         self.files = []
         self.rows = []
+        self.cache = {}
         self.pending_captcha = {}
         for pattern in ("*.xlsx", "*.csv"):
             for path in UPLOAD_DIR.glob(pattern):
@@ -98,6 +99,7 @@ class CloudState:
         for path in REPORT_DIR.glob("*.xlsx"):
             path.unlink(missing_ok=True)
         STATE_PATH.unlink(missing_ok=True)
+        CACHE_PATH.unlink(missing_ok=True)
 
     def add_upload(self, file_storage) -> None:
         filename = secure_filename(file_storage.filename or "")
@@ -416,6 +418,7 @@ class CloudState:
                 with self.job_lock:
                     if self.auto_job.get("stop_requested"):
                         self.auto_job["last_message"] = "Stopped by user."
+                        self.pending_captcha = {}
                         break
                 row = self.next_row()
                 if not row:
@@ -1156,7 +1159,7 @@ async function api(path, body) {
   const response = await fetch(path + suffix, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
   return response.json();
 }
-function setBusy(value) { busy = value; document.querySelectorAll('button').forEach(btn => btn.disabled = value); }
+function setBusy(value) { busy = value; document.querySelectorAll('button').forEach(btn => { if (btn.id !== 'stopAutoBtn') btn.disabled = value; }); }
 function metric(label, value) { return `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`; }
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -1421,10 +1424,16 @@ def api_captcha():
 @app.post("/api/manual-result")
 def api_manual_result():
     data = request.get_json(force=True)
+    clean_number = normalize_number(data.get("number"))
+    if not clean_number:
+        return jsonify({"error": "A valid number is required."}), 400
+    provider = str(data.get("provider") or "").strip()
+    if not provider:
+        return jsonify({"error": "A provider name is required."}), 400
     return jsonify(
         STATE.save_manual_result(
-            normalize_number(data.get("number")),
-            str(data.get("provider") or ""),
+            clean_number,
+            provider,
             str(data.get("raw") or ""),
         )
     )
