@@ -6,6 +6,7 @@ import csv
 import secrets
 import threading
 import time
+import uuid
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +37,9 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 REPORT_DIR = DATA_DIR / "reports"
 CACHE_PATH = DATA_DIR / "telkom_lookup_cache.json"
 STATE_PATH = DATA_DIR / "state.json"
+JOBS_PATH = DATA_DIR / "api_jobs.json"
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
+API_KEYS = {key.strip() for key in os.environ.get("API_KEYS", APP_PASSWORD).replace(",", "\n").splitlines() if key.strip()}
 FORM_URL = "https://www.porting.co.za/PublicWebsiteApp/#/number-inquiry?sid=smppipd4x1"
 
 app = Flask(__name__)
@@ -54,6 +57,8 @@ class CloudState:
         self.files: list[dict[str, str]] = []
         self.rows: list[dict[str, Any]] = []
         self.job_lock = threading.Lock()
+        self.api_job_lock = threading.Lock()
+        self.api_jobs: dict[str, dict[str, Any]] = {}
         self.auto_job: dict[str, Any] = {
             "running": False,
             "stop_requested": False,
@@ -64,6 +69,7 @@ class CloudState:
             "started_at": "",
             "finished_at": "",
         }
+        self.load_api_jobs()
         self.load_state()
 
     def load_state(self) -> None:
@@ -74,6 +80,13 @@ class CloudState:
 
     def save_state(self) -> None:
         STATE_PATH.write_text(json.dumps({"files": self.files}, indent=2), encoding="utf-8")
+
+    def load_api_jobs(self) -> None:
+        if JOBS_PATH.exists():
+            self.api_jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
+
+    def save_api_jobs(self) -> None:
+        JOBS_PATH.write_text(json.dumps(self.api_jobs, indent=2), encoding="utf-8")
 
     def reset(self) -> None:
         self.files = []
@@ -416,6 +429,139 @@ class CloudState:
         self.save_result(result)
         return {"kind": "found", "result": asdict(result)}
 
+    def api_result_from_lookup(self, original_number: Any) -> dict[str, Any]:
+        clean_number = normalize_number(original_number)
+        checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        base = {
+            "input_number": str(original_number or ""),
+            "clean_number": clean_number,
+            "number_type": classify_number(clean_number),
+            "lookup_status": "",
+            "current_provider": "",
+            "telkom_service": None,
+            "raw_result": "",
+            "checked_at": checked_at,
+            "porting_lookup_url": self.porting_lookup_url(clean_number),
+        }
+        if not is_supported_number(clean_number):
+            return {
+                **base,
+                "lookup_status": "unsupported_number",
+                "raw_result": "Number is not a supported South African 011, 012, or mobile number.",
+            }
+        if clean_number in self.cache:
+            result = self.cache[clean_number]
+            return self.api_result_from_lookup_result(str(original_number or ""), result)
+        result_data = self.check_number(clean_number)
+        if result_data.get("kind") == "found":
+            return self.api_result_from_lookup_result(str(original_number or ""), LookupResult(**result_data["result"]))
+        result = LookupResult(**result_data["result"])
+        status = "needs_human_verification" if result_data.get("kind") == "captcha" else "needs_manual_review"
+        return {
+            **base,
+            "lookup_status": status,
+            "raw_result": result_data.get("message") or result.raw_result,
+        }
+
+    def api_result_from_lookup_result(self, original_number: str, result: LookupResult) -> dict[str, Any]:
+        return {
+            "input_number": original_number,
+            "clean_number": result.clean_number,
+            "number_type": classify_number(result.clean_number),
+            "lookup_status": result.lookup_status,
+            "current_provider": result.current_provider,
+            "telkom_service": result.telkom == "Yes",
+            "raw_result": result.raw_result,
+            "checked_at": result.checked_at,
+            "porting_lookup_url": self.porting_lookup_url(result.clean_number),
+        }
+
+    def create_api_job(self, numbers: list[Any], source: str = "api") -> dict[str, Any]:
+        job_id = uuid.uuid4().hex
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        job = {
+            "job_id": job_id,
+            "source": source,
+            "status": "queued",
+            "total": len(numbers),
+            "processed": 0,
+            "telkom": 0,
+            "non_telkom": 0,
+            "needs_review": 0,
+            "created_at": now,
+            "updated_at": now,
+            "message": "Queued.",
+            "inputs": [str(number or "") for number in numbers],
+            "results": [],
+        }
+        with self.api_job_lock:
+            self.api_jobs[job_id] = job
+            self.save_api_jobs()
+        thread = threading.Thread(target=self.process_api_job, args=(job_id,), daemon=True)
+        thread.start()
+        return self.public_api_job(job)
+
+    def process_api_job(self, job_id: str, delay_seconds: float = 1.0) -> None:
+        with self.api_job_lock:
+            job = self.api_jobs[job_id]
+            job["status"] = "running"
+            job["message"] = "Processing."
+            job["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.save_api_jobs()
+        for number in list(job["inputs"]):
+            result = self.api_result_from_lookup(number)
+            with self.api_job_lock:
+                job = self.api_jobs[job_id]
+                job["results"].append(result)
+                job["processed"] = len(job["results"])
+                if result["telkom_service"] is True:
+                    job["telkom"] += 1
+                elif result["telkom_service"] is False:
+                    job["non_telkom"] += 1
+                else:
+                    job["needs_review"] += 1
+                job["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if result["lookup_status"] == "needs_human_verification":
+                    job["status"] = "needs_human_verification"
+                    job["message"] = f"Paused at {result['clean_number']}: human verification is required."
+                    self.save_api_jobs()
+                    return
+                job["message"] = f"Processed {job['processed']} of {job['total']}."
+                self.save_api_jobs()
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+        with self.api_job_lock:
+            job = self.api_jobs[job_id]
+            job["status"] = "completed"
+            job["message"] = "Completed."
+            job["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.save_api_jobs()
+
+    @staticmethod
+    def public_api_job(job: dict[str, Any], include_results: bool = False) -> dict[str, Any]:
+        public = {key: value for key, value in job.items() if key not in {"inputs", "results"}}
+        if include_results:
+            public["results"] = job.get("results", [])
+        return public
+
+    def get_api_job(self, job_id: str, include_results: bool = False) -> dict[str, Any] | None:
+        with self.api_job_lock:
+            job = self.api_jobs.get(job_id)
+            if not job:
+                return None
+            return self.public_api_job(job, include_results=include_results)
+
+    def api_numbers_from_file(self, file_storage) -> list[str]:
+        filename = secure_filename(file_storage.filename or f"api_upload_{uuid.uuid4().hex}.csv")
+        target = UPLOAD_DIR / f"api_{uuid.uuid4().hex}_{filename}"
+        file_storage.save(target)
+        item = {"label": target.stem, "path": str(target)}
+        numbers: list[str] = []
+        for source_row in self.iter_source_rows(item):
+            for phone_row in self.extract_phone_rows(item, source_row):
+                numbers.append(phone_row["clean_number"])
+        return numbers
+
     def export_reports(self) -> dict[str, Any]:
         outputs = []
         for item in self.files:
@@ -612,9 +758,15 @@ STATE = CloudState()
 
 
 def authorized() -> bool:
-    if not APP_PASSWORD:
+    if not APP_PASSWORD and not API_KEYS:
         return True
     supplied = request.args.get("key") or request.headers.get("X-App-Password") or ""
+    api_key = request.headers.get("X-API-Key") or ""
+    auth_header = request.headers.get("Authorization") or ""
+    if auth_header.lower().startswith("bearer "):
+        api_key = auth_header.split(" ", 1)[1].strip()
+    if api_key and any(secrets.compare_digest(api_key, key) for key in API_KEYS):
+        return True
     return secrets.compare_digest(supplied, APP_PASSWORD)
 
 
@@ -906,6 +1058,53 @@ def index():
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
+
+
+@app.post("/v1/lookup")
+def v1_lookup():
+    data = request.get_json(force=True)
+    number = data.get("number") or data.get("msisdn") or ""
+    return jsonify(STATE.api_result_from_lookup(number))
+
+
+@app.post("/v1/batch")
+def v1_batch():
+    data = request.get_json(force=True)
+    numbers = data.get("numbers") or []
+    if not isinstance(numbers, list) or not numbers:
+        return jsonify({"error": "Send JSON with a non-empty numbers array."}), 400
+    if len(numbers) > 5000:
+        return jsonify({"error": "Maximum 5000 numbers per batch job."}), 400
+    return jsonify(STATE.create_api_job(numbers, source="api_batch")), 202
+
+
+@app.post("/v1/files")
+def v1_files():
+    uploaded = request.files.get("file")
+    if not uploaded or not uploaded.filename:
+        return jsonify({"error": "Upload one .xlsx or .csv file using form field 'file'."}), 400
+    if Path(uploaded.filename).suffix.lower() not in {".xlsx", ".csv"}:
+        return jsonify({"error": "Only .xlsx and .csv files are supported."}), 400
+    numbers = STATE.api_numbers_from_file(uploaded)
+    if not numbers:
+        return jsonify({"error": "No supported 011, 012, or mobile numbers were found."}), 400
+    return jsonify(STATE.create_api_job(numbers, source=f"file:{secure_filename(uploaded.filename)}")), 202
+
+
+@app.get("/v1/jobs/<job_id>")
+def v1_job(job_id: str):
+    job = STATE.get_api_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+    return jsonify(job)
+
+
+@app.get("/v1/jobs/<job_id>/results")
+def v1_job_results(job_id: str):
+    job = STATE.get_api_job(job_id, include_results=True)
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+    return jsonify(job)
 
 
 @app.post("/upload")
