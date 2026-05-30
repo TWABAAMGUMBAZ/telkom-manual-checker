@@ -359,13 +359,22 @@ class CloudState:
         response = self.client.request("GET", "captcha/captcha-gen")
         image_data = str(response.get("imageData") or "")
         string_data = str(response.get("stringData") or "")
-        self.pending_captcha[clean_number] = {"captchaEncrypt": string_data}
+        self.pending_captcha[clean_number] = {"captchaEncrypt": string_data, "imageData": image_data}
         return {
             "kind": "captcha",
             "number": clean_number,
             "imageData": image_data,
             "message": "The Porting site requested captcha verification. Type the captcha shown, then continue automatic checking.",
         }
+
+    def pending_captcha_payload(self) -> dict[str, str] | None:
+        for number, data in self.pending_captcha.items():
+            return {
+                "number": number,
+                "imageData": data.get("imageData", ""),
+                "message": "The Porting site requested captcha verification. Type the captcha shown, then continue automatic checking.",
+            }
+        return None
 
     def submit_captcha(self, clean_number: str, code: str) -> dict[str, Any]:
         pending = self.pending_captcha.get(clean_number)
@@ -726,6 +735,7 @@ const key = new URLSearchParams(location.search).get('key') || '';
 const suffix = key ? '?key=' + encodeURIComponent(key) : '';
 let current = null;
 let busy = false;
+let captchaNumber = '';
 const formBase = 'https://www.porting.co.za/PublicWebsiteApp/#/number-inquiry?sid=smppipd4x1';
 async function api(path, body) {
   const response = await fetch(path + suffix, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
@@ -756,7 +766,7 @@ function renderJob(job) {
   box.textContent = `Automatic checker: ${running}\\nChecked this run: ${job.checked_now || 0}\\nLast number: ${job.last_number || '-'}\\n${job.last_message || ''}`;
 }
 function renderCurrent(row) {
-  current = row; document.getElementById('manualBox').style.display = 'none'; document.getElementById('captchaBox').style.display = 'none';
+  current = row; document.getElementById('manualBox').style.display = 'none'; document.getElementById('captchaBox').style.display = 'none'; captchaNumber = '';
   document.getElementById('manualProvider').value = ''; document.getElementById('manualRaw').value = ''; document.getElementById('captchaInput').value = '';
   if (!row) {
     document.getElementById('company').textContent = 'No unchecked row available';
@@ -783,6 +793,7 @@ function showManual(data) {
   document.getElementById('result').textContent += '\\n\\n' + data.message;
 }
 function showCaptcha(data) {
+  captchaNumber = data.number || (current ? current.clean_number : '');
   document.getElementById('captchaBox').style.display = 'block';
   document.getElementById('manualBox').style.display = 'none';
   document.getElementById('captchaImg').src = 'data:image/jpeg;base64,' + data.imageData;
@@ -793,6 +804,7 @@ function showCaptcha(data) {
 async function refresh() {
   const data = await api('/api/state');
   renderSummary(data.summary); renderCurrent(data.next); renderRecent(data.recent);
+  if (data.pending_captcha) showCaptcha(data.pending_captcha);
 }
 async function checkCurrent() {
   if (!current || busy) return; setBusy(true);
@@ -825,12 +837,13 @@ function openForm() {
   window.open(url, '_blank', 'noopener');
 }
 async function submitCaptcha() {
-  if (!current || busy) return;
+  const number = captchaNumber || (current ? current.clean_number : '');
+  if (!number || busy) return;
   const code = document.getElementById('captchaInput').value.trim();
   if (!code) return;
   setBusy(true);
   try {
-    const data = await api('/api/captcha', { number: current.clean_number, code });
+    const data = await api('/api/captcha', { number, code });
     if (data.kind === 'captcha') {
       showCaptcha(data);
       document.getElementById('result').textContent = 'That code was not accepted. Try the new captcha.';
@@ -908,7 +921,14 @@ def upload():
 
 @app.get("/api/state")
 def api_state():
-    return jsonify({"summary": STATE.summary(), "next": STATE.next_row(), "recent": STATE.checked_rows()})
+    return jsonify(
+        {
+            "summary": STATE.summary(),
+            "next": STATE.next_row(),
+            "recent": STATE.checked_rows(),
+            "pending_captcha": STATE.pending_captcha_payload(),
+        }
+    )
 
 
 @app.post("/api/check")
