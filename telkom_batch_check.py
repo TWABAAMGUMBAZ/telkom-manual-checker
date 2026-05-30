@@ -97,8 +97,8 @@ def normalize_number(value: Any) -> str:
         return ""
 
     # Excel may store some phone-looking values as floats.
-    if re.fullmatch(r"\d+\.0", text):
-        text = text[:-2]
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text[: text.index(".")]
 
     digits = re.sub(r"\D", "", text)
     if not digits:
@@ -185,14 +185,7 @@ def parse_result(clean_number: str, response_data: dict[str, Any]) -> LookupResu
     error_code = str(response_data.get("errorCode") or "").strip()
 
     if response_data.get("captchaEnabled") is True:
-        return LookupResult(
-            clean_number,
-            "Needs review",
-            "",
-            "Unknown",
-            "The public lookup requested captcha verification. This row was not automated.",
-            checked_at,
-        )
+        return captcha_required_result(clean_number)
 
     if error_code == "NPC4046E":
         return captcha_required_result(clean_number)
