@@ -101,6 +101,52 @@ The API reads the first sheet for Excel, or header row for CSV, extracts support
 
 This API is now job-based and responsive, but the current lookup engine still depends on the public Porting flow. For a commercial resale API, replace the lookup engine with a licensed South African operator/porting data provider. The customer-facing endpoints can stay the same.
 
+## Lookup Provider Modes
+
+The app now has a pluggable lookup engine. Set `LOOKUP_PROVIDER` in Render:
+
+```text
+LOOKUP_PROVIDER=public_crdb
+```
+
+Uses the current public CRDB/Porting flow. This may require human captcha.
+
+```text
+LOOKUP_PROVIDER=mock
+```
+
+Development mode. Returns fake Telkom/BACKSPACE results without network calls.
+
+```text
+LOOKUP_PROVIDER=licensed_http
+LICENSED_LOOKUP_URL=https://your-provider.example.com/lookup
+LICENSED_LOOKUP_API_KEY=your-provider-key
+```
+
+Production mode for a licensed lookup provider. The platform sends:
+
+```json
+{
+  "number": "0127913714",
+  "msisdn": "0127913714"
+}
+```
+
+The licensed provider can return any of these equivalent fields:
+
+```json
+{
+  "provider": "TELKOM",
+  "current_provider": "TELKOM",
+  "operator": "TELKOM",
+  "network": "TELKOM",
+  "status": "Found",
+  "message": "Number is serviced by TELKOM"
+}
+```
+
+If a provider/operator/network value is present, the platform records the lookup as `Found`, applies the Telkom-service rule, caches the result, and continues batch/API jobs without captcha.
+
 ## Field Planning Exports
 
 The web app exports three workbooks:
