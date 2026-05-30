@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import csv
 import secrets
 from dataclasses import asdict
 from datetime import datetime
@@ -17,10 +18,13 @@ from werkzeug.utils import secure_filename
 from telkom_batch_check import (
     CrdbClient,
     LookupResult,
+    classify_number,
+    is_supported_number,
     load_cache,
     normalize_number,
     parse_result,
-    process_workbook,
+    provider_is_telkom,
+    query_number,
     save_cache,
 )
 
@@ -61,16 +65,17 @@ class CloudState:
         self.files = []
         self.rows = []
         self.pending_captcha = {}
-        for path in UPLOAD_DIR.glob("*.xlsx"):
-            path.unlink(missing_ok=True)
+        for pattern in ("*.xlsx", "*.csv"):
+            for path in UPLOAD_DIR.glob(pattern):
+                path.unlink(missing_ok=True)
         for path in REPORT_DIR.glob("*.xlsx"):
             path.unlink(missing_ok=True)
         STATE_PATH.unlink(missing_ok=True)
 
     def add_upload(self, file_storage) -> None:
         filename = secure_filename(file_storage.filename or "")
-        if not filename.lower().endswith(".xlsx"):
-            raise ValueError("Please upload .xlsx files only.")
+        if Path(filename).suffix.lower() not in {".xlsx", ".csv"}:
+            raise ValueError("Please upload .xlsx or .csv files only.")
         target = UPLOAD_DIR / filename
         file_storage.save(target)
         label = target.stem.replace("_", " ").replace("-", " ").title()
@@ -85,52 +90,132 @@ class CloudState:
             path = Path(item["path"])
             if not path.exists():
                 continue
-            wb = load_workbook(path, read_only=True, data_only=True)
-            ws = wb.active
-            row_iter = ws.iter_rows(values_only=True)
-            headers = list(next(row_iter, []) or [])
-            number_col = self.find_number_column(headers)
-            company_col = 1
-            for row_num, values in enumerate(row_iter, start=2):
-                company = values[company_col - 1] if len(values) >= company_col else ""
-                original = values[number_col - 1] if len(values) >= number_col else ""
-                clean = normalize_number(original)
-                rows.append(
-                    {
-                        "area": item["label"],
-                        "source": str(path),
-                        "row": row_num,
-                        "company": company or "",
-                        "original_number": original or "",
-                        "clean_number": clean,
-                    }
-                )
-            wb.close()
+            for row in self.iter_source_rows(item):
+                rows.extend(self.extract_phone_rows(item, row))
         return rows
 
     @staticmethod
-    def find_number_column(headers: list[Any]) -> int:
+    def find_number_columns(headers: list[Any]) -> list[int]:
+        matches: list[int] = []
         for idx, header in enumerate(headers, start=1):
             text = str(header or "").strip().lower()
             if text == "contact number" or ("contact" in text and "number" in text):
+                matches.append(idx)
+                continue
+            if text in {"phone", "phone number", "telephone", "number", "msisdn", "mobile", "cell", "cellphone"}:
+                matches.append(idx)
+        return matches or [2]
+
+    @staticmethod
+    def find_company_column(headers: list[Any]) -> int:
+        for idx, header in enumerate(headers, start=1):
+            text = str(header or "").strip().lower()
+            if text in {"company", "company name", "business", "business name", "name"}:
                 return idx
-            if text in {"phone", "phone number", "telephone", "number", "msisdn"}:
-                return idx
-        return 2
+        return 1
+
+    def iter_source_rows(self, item: dict[str, str]) -> list[dict[str, Any]]:
+        path = Path(item["path"])
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            return self.iter_csv_rows(path)
+        return self.iter_xlsx_rows(path)
+
+    def iter_xlsx_rows(self, path: Path) -> list[dict[str, Any]]:
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            row_iter = ws.iter_rows(values_only=True)
+            headers = list(next(row_iter, []) or [])
+            number_cols = self.find_number_columns(headers)
+            company_col = self.find_company_column(headers)
+            rows = []
+            for row_num, values in enumerate(row_iter, start=2):
+                rows.append(
+                    {
+                        "row": row_num,
+                        "headers": headers,
+                        "values": list(values or []),
+                        "number_cols": number_cols,
+                        "company_col": company_col,
+                    }
+                )
+            return rows
+        finally:
+            wb.close()
+
+    def iter_csv_rows(self, path: Path) -> list[dict[str, Any]]:
+        text = ""
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                text = path.read_text(encoding=encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        reader = csv.reader(text.splitlines())
+        rows = list(reader)
+        if not rows:
+            return []
+        headers = rows[0]
+        number_cols = self.find_number_columns(headers)
+        company_col = self.find_company_column(headers)
+        return [
+            {
+                "row": idx,
+                "headers": headers,
+                "values": values,
+                "number_cols": number_cols,
+                "company_col": company_col,
+            }
+            for idx, values in enumerate(rows[1:], start=2)
+        ]
+
+    def extract_phone_rows(self, item: dict[str, str], source_row: dict[str, Any]) -> list[dict[str, Any]]:
+        values = source_row["values"]
+        headers = source_row["headers"]
+        company_col = source_row["company_col"]
+        company = values[company_col - 1] if len(values) >= company_col else ""
+        extracted: list[dict[str, Any]] = []
+        seen_numbers: set[str] = set()
+        for number_col in source_row["number_cols"]:
+            original = values[number_col - 1] if len(values) >= number_col else ""
+            clean = normalize_number(original)
+            if not is_supported_number(clean) or clean in seen_numbers:
+                continue
+            seen_numbers.add(clean)
+            header = headers[number_col - 1] if len(headers) >= number_col else "Number"
+            extracted.append(
+                {
+                    "area": item["label"],
+                    "source": item["path"],
+                    "row": source_row["row"],
+                    "company": company or "",
+                    "source_column": str(header or "Number"),
+                    "original_number": original or "",
+                    "clean_number": clean,
+                    "number_type": classify_number(clean),
+                }
+            )
+        return extracted
 
     def summary(self) -> dict[str, Any]:
         checked_numbers = {number for number, result in self.cache.items() if result.lookup_status == "Found"}
         checked_rows = [row for row in self.rows if row["clean_number"] in checked_numbers]
         telkom_rows = [row for row in checked_rows if self.cache[row["clean_number"]].telkom == "Yes"]
         non_telkom_rows = [row for row in checked_rows if self.cache[row["clean_number"]].telkom == "No"]
+        unique_numbers = {row["clean_number"] for row in self.rows if row["clean_number"]}
         return {
             "files": len(self.files),
             "total_rows": len(self.rows),
+            "unique_numbers": len(unique_numbers),
             "checked_rows": len(checked_rows),
             "remaining_rows": len(self.rows) - len(checked_rows),
             "unique_checked_numbers": len(checked_numbers),
             "telkom_rows": len(telkom_rows),
             "non_telkom_rows": len(non_telkom_rows),
+            "joburg_rows": sum(1 for row in self.rows if row.get("number_type") == "Johannesburg 011"),
+            "tshwane_rows": sum(1 for row in self.rows if row.get("number_type") == "Tshwane 012"),
+            "mobile_rows": sum(1 for row in self.rows if row.get("number_type") == "Mobile"),
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -154,6 +239,7 @@ class CloudState:
                     "provider": result.current_provider,
                     "telkom": result.telkom,
                     "raw": result.raw_result,
+                    "number_type": row.get("number_type", ""),
                 }
             )
         return items[-limit:]
@@ -166,10 +252,31 @@ class CloudState:
     def check_number(self, clean_number: str) -> dict[str, Any]:
         if clean_number in self.cache:
             return {"kind": "found", "result": asdict(self.cache[clean_number])}
-        response = self.client.submit_number(clean_number)
-        result = parse_result(clean_number, response)
+        result = query_number(self.client, clean_number)
         if result.lookup_status == "Captcha required":
             return self.new_captcha(clean_number)
+        if result.lookup_status == "Found":
+            self.save_result(result)
+            return {"kind": "found", "result": asdict(result)}
+        return {
+            "kind": "manual",
+            "number": clean_number,
+            "formUrl": f"https://www.porting.co.za/PublicWebsiteApp/#/number-inquiry?sid=smppipd4x1&msisdn={clean_number}",
+            "result": asdict(result),
+            "message": "Endpoint lookup did not return a confirmed provider. Use the public form fallback, complete any captcha shown there, then save the visible provider here.",
+        }
+
+    def save_manual_result(self, clean_number: str, provider: str, raw_result: str = "") -> dict[str, Any]:
+        provider = provider.strip().upper()
+        raw = raw_result.strip() or f"Manual form result saved from public number-inquiry page: {provider}"
+        result = LookupResult(
+            clean_number,
+            "Found",
+            provider,
+            "Yes" if provider_is_telkom(provider) else "No",
+            raw,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
         self.save_result(result)
         return {"kind": "found", "result": asdict(result)}
 
@@ -208,58 +315,179 @@ class CloudState:
         for item in self.files:
             source = Path(item["path"])
             output = REPORT_DIR / f"{source.stem}_manual_checked.xlsx"
-            process_workbook(source, output, self.cache, CACHE_PATH, delay_seconds=0, cache_only=True)
+            self.export_full_report(item, output)
             outputs.append({"label": output.name, "url": url_for("download_report", filename=output.name)})
         telkom = self.export_telkom_only()
         outputs.append({"label": telkom.name, "url": url_for("download_report", filename=telkom.name)})
         return {"outputs": outputs}
+
+    def result_for_export(self, clean_number: str) -> LookupResult:
+        if not clean_number:
+            return LookupResult(
+                "",
+                "Skipped",
+                "",
+                "Unknown",
+                "No supported +27 11, +27 12, or South African mobile number was found in this row.",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        result = self.cache.get(clean_number)
+        if result:
+            return result
+        return LookupResult(
+            clean_number,
+            "Pending",
+            "",
+            "Unknown",
+            "Not checked yet. Resume checking in the cloud app, then export again.",
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    def export_full_report(self, item: dict[str, str], output: Path) -> None:
+        source_rows = self.iter_source_rows(item)
+        headers = source_rows[0]["headers"] if source_rows else []
+        result_headers = [
+            "Clean Number",
+            "Number Type",
+            "Lookup Status",
+            "Current Provider",
+            "Telkom Service?",
+            "Raw Result",
+            "Checked At",
+        ]
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Checked Report"
+        for col, header in enumerate(list(headers) + result_headers, start=1):
+            cell = ws.cell(1, col, header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        out_row = 2
+        for source_row in source_rows:
+            extracted = self.extract_phone_rows(item, source_row)
+            if not extracted:
+                self.write_report_row(ws, out_row, source_row["values"], len(headers), "", "", self.result_for_export(""))
+                out_row += 1
+                continue
+            for phone_row in extracted:
+                result = self.result_for_export(phone_row["clean_number"])
+                self.write_report_row(
+                    ws,
+                    out_row,
+                    source_row["values"],
+                    len(headers),
+                    phone_row["clean_number"],
+                    phone_row["number_type"],
+                    result,
+                )
+                out_row += 1
+
+        self.finish_workbook(ws)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(output)
+
+    def write_report_row(
+        self,
+        ws,
+        out_row: int,
+        values: list[Any],
+        header_count: int,
+        clean_number: str,
+        number_type: str,
+        result: LookupResult,
+    ) -> None:
+        for col, value in enumerate(values, start=1):
+            ws.cell(out_row, col, value)
+        first_result_col = header_count + 1
+        export_values = [
+            clean_number or result.clean_number,
+            number_type or classify_number(result.clean_number),
+            result.lookup_status,
+            result.current_provider,
+            result.telkom,
+            result.raw_result,
+            result.checked_at,
+        ]
+        for offset, value in enumerate(export_values):
+            ws.cell(out_row, first_result_col + offset, value)
+        self.style_export_row(ws, out_row, first_result_col, result.telkom, len(export_values))
+
+    @staticmethod
+    def style_export_row(ws, row: int, first_result_col: int, telkom_value: str, width: int) -> None:
+        green = PatternFill("solid", fgColor="C6EFCE")
+        red = PatternFill("solid", fgColor="F4CCCC")
+        amber = PatternFill("solid", fgColor="FFE699")
+        fill = amber
+        if telkom_value == "Yes":
+            fill = green
+        elif telkom_value == "No":
+            fill = red
+        for col in range(first_result_col, first_result_col + width):
+            ws.cell(row, col).fill = fill
+            ws.cell(row, col).alignment = Alignment(vertical="top", wrap_text=True)
+
+    @staticmethod
+    def finish_workbook(ws) -> None:
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for col in range(1, ws.max_column + 1):
+            max_len = max(len(str(ws.cell(row, col).value or "")) for row in range(1, min(ws.max_row, 120) + 1))
+            ws.column_dimensions[get_column_letter(col)].width = min(max(max_len + 2, 10), 58)
 
     def export_telkom_only(self) -> Path:
         output = REPORT_DIR / "telkom_companies_only.xlsx"
         out_wb = Workbook()
         out_ws = out_wb.active
         out_ws.title = "Telkom Companies"
-        out_row = 1
-        wrote_header = False
+        headers = [
+            "Source File",
+            "Company",
+            "Original Number",
+            "Clean Number",
+            "Number Type",
+            "Current Provider",
+            "Raw Result",
+            "Checked At",
+        ]
+        for col, value in enumerate(headers, start=1):
+            cell = out_ws.cell(1, col, value)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
+        out_row = 2
+        seen_rows: set[tuple[str, int, str]] = set()
         for item in self.files:
-            source = Path(item["path"])
-            wb = load_workbook(source, data_only=True)
-            ws = wb.active
-            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-            number_col = self.find_number_column(headers)
-            if not wrote_header:
-                for col, value in enumerate(["Area"] + headers + ["Clean Number", "Current Provider", "Raw Result"], start=1):
-                    cell = out_ws.cell(out_row, col, value)
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = PatternFill("solid", fgColor="1F4E78")
-                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                wrote_header = True
-                out_row += 1
-            for row_num in range(2, ws.max_row + 1):
-                clean = normalize_number(ws.cell(row_num, number_col).value)
-                result = self.cache.get(clean)
+            for phone_row in [row for row in self.rows if row["source"] == item["path"]]:
+                key = (phone_row["source"], phone_row["row"], phone_row["clean_number"])
+                if key in seen_rows:
+                    continue
+                seen_rows.add(key)
+                result = self.cache.get(phone_row["clean_number"])
                 if not result or result.telkom != "Yes":
                     continue
-                out_ws.cell(out_row, 1, item["label"])
-                for col in range(1, ws.max_column + 1):
-                    out_ws.cell(out_row, col + 1, ws.cell(row_num, col).value)
-                start = ws.max_column + 2
-                out_ws.cell(out_row, start, result.clean_number)
-                out_ws.cell(out_row, start + 1, result.current_provider)
-                out_ws.cell(out_row, start + 2, result.raw_result)
+                values = [
+                    item["label"],
+                    phone_row.get("company", ""),
+                    phone_row.get("original_number", ""),
+                    result.clean_number,
+                    phone_row.get("number_type", classify_number(result.clean_number)),
+                    result.current_provider,
+                    result.raw_result,
+                    result.checked_at,
+                ]
+                for col, value in enumerate(values, start=1):
+                    out_ws.cell(out_row, col, value)
                 out_row += 1
-            wb.close()
 
         for row in range(2, out_ws.max_row + 1):
             for col in range(1, out_ws.max_column + 1):
                 out_ws.cell(row, col).fill = PatternFill("solid", fgColor="C6EFCE")
                 out_ws.cell(row, col).alignment = Alignment(vertical="top", wrap_text=True)
-        out_ws.freeze_panes = "A2"
-        out_ws.auto_filter.ref = out_ws.dimensions
-        for col in range(1, out_ws.max_column + 1):
-            max_len = max(len(str(out_ws.cell(row, col).value or "")) for row in range(1, out_ws.max_row + 1))
-            out_ws.column_dimensions[get_column_letter(col)].width = min(max(max_len + 2, 10), 52)
+        self.finish_workbook(out_ws)
         out_wb.save(output)
         return output
 
@@ -327,15 +555,15 @@ PAGE = """
   <header>
     <div>
       <h1>Telkom Cloud Checker</h1>
-      <p>Upload Excel files, check each number, type captcha when requested, then export reports.</p>
+      <p>Upload Excel or CSV files, check 011, 012 and mobile numbers, complete captcha manually when requested, then export reports.</p>
     </div>
     <button class="secondary" id="exportBtn">Export Reports</button>
   </header>
 
   <section class="panel">
-    <form action="/upload{% if key %}?key={{ key }}{% endif %}" method="post" enctype="multipart/form-data">
-      <div class="label">Upload .xlsx files</div>
-      <input type="file" name="files" multiple accept=".xlsx">
+    <form action="/upload{% if key %}?key={{ key|urlencode }}{% endif %}" method="post" enctype="multipart/form-data">
+      <div class="label">Upload .xlsx or .csv files</div>
+      <input type="file" name="files" multiple accept=".xlsx,.csv">
       <button type="submit">Upload</button>
       <button class="danger" type="button" id="resetBtn">Reset Uploaded Files</button>
     </form>
@@ -346,11 +574,12 @@ PAGE = """
   <section class="panel">
     <div class="row-title">
       <div><div class="label">Company</div><div class="value" id="company">Loading...</div></div>
-      <div><div class="label">Number</div><div class="value" id="number"></div></div>
+      <div><div class="label">Number</div><div class="value" id="number"></div><div class="label" id="numberType"></div></div>
       <div><div class="label">File</div><div class="value" id="area"></div></div>
     </div>
     <div class="actions">
       <button id="checkBtn">Check This Number</button>
+      <button class="secondary" id="formBtn">Open Porting Form</button>
       <button class="secondary" id="skipBtn">Skip For Now</button>
     </div>
     <div class="captcha" id="captchaBox">
@@ -361,6 +590,14 @@ PAGE = """
         <button id="captchaBtn">Submit Captcha</button>
       </div>
     </div>
+    <div class="captcha" id="manualBox">
+      <div class="label">Manual form result</div>
+      <div class="actions">
+        <input id="manualProvider" autocomplete="off" placeholder="Provider, e.g. TELKOM or BACKSPACE">
+        <input id="manualRaw" autocomplete="off" placeholder="Optional visible message">
+        <button id="manualBtn">Save Provider</button>
+      </div>
+    </div>
     <div id="result" class="result"></div>
     <div id="downloads"></div>
   </section>
@@ -368,7 +605,7 @@ PAGE = """
   <section class="panel">
     <h2>Recent Checked Rows</h2>
     <table>
-      <thead><tr><th>File</th><th>Company</th><th>Number</th><th>Provider</th><th>Telkom?</th></tr></thead>
+      <thead><tr><th>File</th><th>Company</th><th>Number</th><th>Type</th><th>Provider</th><th>Telkom Service?</th></tr></thead>
       <tbody id="recent"></tbody>
     </table>
   </section>
@@ -378,37 +615,54 @@ const key = new URLSearchParams(location.search).get('key') || '';
 const suffix = key ? '?key=' + encodeURIComponent(key) : '';
 let current = null;
 let busy = false;
+const formBase = 'https://www.porting.co.za/PublicWebsiteApp/#/number-inquiry?sid=smppipd4x1';
 async function api(path, body) {
   const response = await fetch(path + suffix, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
   return response.json();
 }
 function setBusy(value) { busy = value; document.querySelectorAll('button').forEach(btn => btn.disabled = value); }
 function metric(label, value) { return `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`; }
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+function withKey(url) {
+  if (!key) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(key);
+}
 function renderSummary(summary) {
   document.getElementById('summary').innerHTML = [
-    metric('Files', summary.files), metric('Total rows', summary.total_rows), metric('Checked', summary.checked_rows),
-    metric('Remaining', summary.remaining_rows), metric('Telkom', summary.telkom_rows), metric('Non-Telkom', summary.non_telkom_rows)
+    metric('Files', summary.files), metric('Queue rows', summary.total_rows), metric('Unique numbers', summary.unique_numbers),
+    metric('Checked', summary.checked_rows), metric('Remaining', summary.remaining_rows), metric('Telkom', summary.telkom_rows),
+    metric('011 rows', summary.joburg_rows), metric('012 rows', summary.tshwane_rows), metric('Mobile rows', summary.mobile_rows),
+    metric('Non-Telkom', summary.non_telkom_rows)
   ].join('');
 }
 function renderCurrent(row) {
-  current = row; document.getElementById('captchaBox').style.display = 'none'; document.getElementById('captchaInput').value = '';
+  current = row; document.getElementById('captchaBox').style.display = 'none'; document.getElementById('manualBox').style.display = 'none';
+  document.getElementById('captchaInput').value = ''; document.getElementById('manualProvider').value = ''; document.getElementById('manualRaw').value = '';
   if (!row) {
     document.getElementById('company').textContent = 'No unchecked row available';
-    document.getElementById('number').textContent = ''; document.getElementById('area').textContent = '';
+    document.getElementById('number').textContent = ''; document.getElementById('numberType').textContent = ''; document.getElementById('area').textContent = '';
     document.getElementById('result').textContent = 'Upload files or export reports if checking is complete.'; return;
   }
   document.getElementById('company').textContent = row.company;
   document.getElementById('number').textContent = row.clean_number;
+  document.getElementById('numberType').textContent = row.number_type || '';
   document.getElementById('area').textContent = row.area;
 }
 function renderRecent(rows) {
   document.getElementById('recent').innerHTML = rows.slice().reverse().map(row => `
-    <tr><td>${row.area}</td><td>${row.company}</td><td>${row.clean_number}</td><td>${row.provider}</td><td>${row.telkom}</td></tr>`).join('');
+    <tr><td>${esc(row.area)}</td><td>${esc(row.company)}</td><td>${esc(row.clean_number)}</td><td>${esc(row.number_type)}</td><td>${esc(row.provider)}</td><td>${esc(row.telkom)}</td></tr>`).join('');
 }
 function showResult(result) {
   const box = document.getElementById('result');
   box.className = 'result ' + (result.telkom === 'Yes' ? 'yes' : result.telkom === 'No' ? 'no' : 'unknown');
   box.textContent = `${result.lookup_status}\\nProvider: ${result.current_provider || 'Unknown'}\\nTelkom: ${result.telkom}\\n${result.raw_result}`;
+}
+function showManual(data) {
+  showResult(data.result);
+  document.getElementById('manualBox').style.display = 'block';
+  document.getElementById('result').textContent += '\\n\\n' + data.message;
 }
 async function refresh() {
   const data = await api('/api/state');
@@ -423,6 +677,8 @@ async function checkCurrent() {
       document.getElementById('captchaImg').src = 'data:image/jpeg;base64,' + data.imageData;
       document.getElementById('result').textContent = data.message;
       document.getElementById('captchaInput').focus();
+    } else if (data.kind === 'manual') {
+      showManual(data);
     } else { showResult(data.result); await refresh(); }
   } finally { setBusy(false); }
 }
@@ -440,16 +696,39 @@ async function submitCaptcha() {
     } else { document.getElementById('captchaBox').style.display = 'none'; showResult(data.result); await refresh(); }
   } finally { setBusy(false); }
 }
+function openForm() {
+  const number = current ? current.clean_number : '';
+  const url = number ? formBase + '&msisdn=' + encodeURIComponent(number) : formBase;
+  window.open(url, '_blank', 'noopener');
+}
+async function saveManual() {
+  if (!current || busy) return;
+  const provider = document.getElementById('manualProvider').value.trim();
+  if (!provider) return;
+  setBusy(true);
+  try {
+    const data = await api('/api/manual-result', {
+      number: current.clean_number,
+      provider,
+      raw: document.getElementById('manualRaw').value.trim()
+    });
+    document.getElementById('manualBox').style.display = 'none';
+    showResult(data.result); await refresh();
+  } finally { setBusy(false); }
+}
 document.getElementById('checkBtn').addEventListener('click', checkCurrent);
+document.getElementById('formBtn').addEventListener('click', openForm);
 document.getElementById('captchaBtn').addEventListener('click', submitCaptcha);
+document.getElementById('manualBtn').addEventListener('click', saveManual);
 document.getElementById('captchaInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitCaptcha(); });
+document.getElementById('manualProvider').addEventListener('keydown', e => { if (e.key === 'Enter') saveManual(); });
 document.getElementById('skipBtn').addEventListener('click', refresh);
 document.getElementById('resetBtn').addEventListener('click', async () => { if (confirm('Remove uploaded files from this cloud app?')) { await api('/api/reset', {}); await refresh(); } });
 document.getElementById('exportBtn').addEventListener('click', async () => {
   setBusy(true);
   try {
     const data = await api('/api/export', {});
-    document.getElementById('downloads').innerHTML = data.outputs.map(item => `<a class="download" href="${item.url}${key ? '&key=' + encodeURIComponent(key) : ''}">${item.label}</a>`).join('');
+    document.getElementById('downloads').innerHTML = data.outputs.map(item => `<a class="download" href="${withKey(item.url)}">${esc(item.label)}</a>`).join('');
     await refresh();
   } finally { setBusy(false); }
 });
@@ -494,6 +773,18 @@ def api_check():
 def api_captcha():
     data = request.get_json(force=True)
     return jsonify(STATE.submit_captcha(str(data.get("number") or ""), str(data.get("code") or "")))
+
+
+@app.post("/api/manual-result")
+def api_manual_result():
+    data = request.get_json(force=True)
+    return jsonify(
+        STATE.save_manual_result(
+            normalize_number(data.get("number")),
+            str(data.get("provider") or ""),
+            str(data.get("raw") or ""),
+        )
+    )
 
 
 @app.post("/api/export")
