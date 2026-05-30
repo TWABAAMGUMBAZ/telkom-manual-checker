@@ -4,6 +4,8 @@ import json
 import os
 import csv
 import secrets
+import threading
+import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +24,6 @@ from telkom_batch_check import (
     is_supported_number,
     load_cache,
     normalize_number,
-    parse_result,
     provider_is_telkom,
     query_number,
     save_cache,
@@ -35,6 +36,7 @@ REPORT_DIR = DATA_DIR / "reports"
 CACHE_PATH = DATA_DIR / "telkom_lookup_cache.json"
 STATE_PATH = DATA_DIR / "state.json"
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
+FORM_URL = "https://www.porting.co.za/PublicWebsiteApp/#/number-inquiry?sid=smppipd4x1"
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(16))
@@ -47,9 +49,19 @@ class CloudState:
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
         self.client = CrdbClient(timeout=45)
         self.cache = load_cache(CACHE_PATH)
-        self.pending_captcha: dict[str, dict[str, str]] = {}
         self.files: list[dict[str, str]] = []
         self.rows: list[dict[str, Any]] = []
+        self.job_lock = threading.Lock()
+        self.auto_job: dict[str, Any] = {
+            "running": False,
+            "stop_requested": False,
+            "checked_now": 0,
+            "last_number": "",
+            "last_message": "Idle",
+            "blocked": False,
+            "started_at": "",
+            "finished_at": "",
+        }
         self.load_state()
 
     def load_state(self) -> None:
@@ -64,7 +76,6 @@ class CloudState:
     def reset(self) -> None:
         self.files = []
         self.rows = []
-        self.pending_captcha = {}
         for pattern in ("*.xlsx", "*.csv"):
             for path in UPLOAD_DIR.glob(pattern):
                 path.unlink(missing_ok=True)
@@ -83,6 +94,10 @@ class CloudState:
         self.files.append({"label": label, "path": str(target)})
         self.save_state()
         self.rows = self.load_rows()
+
+    @staticmethod
+    def porting_lookup_url(clean_number: str) -> str:
+        return f"{FORM_URL}&msisdn={clean_number}" if clean_number else FORM_URL
 
     def load_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -217,6 +232,7 @@ class CloudState:
             "tshwane_rows": sum(1 for row in self.rows if row.get("number_type") == "Tshwane 012"),
             "mobile_rows": sum(1 for row in self.rows if row.get("number_type") == "Mobile"),
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "auto_job": dict(self.auto_job),
         }
 
     def next_row(self) -> dict[str, Any] | None:
@@ -249,21 +265,85 @@ class CloudState:
             self.cache[result.clean_number] = result
             save_cache(CACHE_PATH, self.cache)
 
+    def start_auto_check(self, delay_seconds: float = 1.5) -> dict[str, Any]:
+        with self.job_lock:
+            if self.auto_job.get("running"):
+                return dict(self.auto_job)
+            self.auto_job.update(
+                {
+                    "running": True,
+                    "stop_requested": False,
+                    "checked_now": 0,
+                    "last_number": "",
+                    "last_message": "Starting automatic checks.",
+                    "blocked": False,
+                    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "finished_at": "",
+                }
+            )
+        thread = threading.Thread(target=self.auto_check_worker, args=(delay_seconds,), daemon=True)
+        thread.start()
+        return dict(self.auto_job)
+
+    def stop_auto_check(self) -> dict[str, Any]:
+        with self.job_lock:
+            self.auto_job["stop_requested"] = True
+            self.auto_job["last_message"] = "Stopping after the current lookup."
+            return dict(self.auto_job)
+
+    def auto_check_worker(self, delay_seconds: float) -> None:
+        try:
+            while True:
+                with self.job_lock:
+                    if self.auto_job.get("stop_requested"):
+                        self.auto_job["last_message"] = "Stopped by user."
+                        break
+                row = self.next_row()
+                if not row:
+                    with self.job_lock:
+                        self.auto_job["last_message"] = "All queued numbers with automatic results are complete."
+                    break
+                clean_number = row["clean_number"]
+                result_data = self.check_number(clean_number)
+                with self.job_lock:
+                    self.auto_job["last_number"] = clean_number
+                    if result_data.get("kind") == "found":
+                        self.auto_job["checked_now"] += 1
+                        result = result_data.get("result", {})
+                        self.auto_job["last_message"] = (
+                            f"{clean_number}: {result.get('current_provider') or 'Unknown'} "
+                            f"({result.get('telkom') or 'Unknown'})"
+                        )
+                    else:
+                        self.auto_job["blocked"] = True
+                        self.auto_job["last_message"] = (
+                            f"Paused at {clean_number}: manual form verification is needed."
+                        )
+                        break
+                if delay_seconds > 0:
+                    time.sleep(delay_seconds)
+        finally:
+            with self.job_lock:
+                self.auto_job["running"] = False
+                self.auto_job["stop_requested"] = False
+                self.auto_job["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     def check_number(self, clean_number: str) -> dict[str, Any]:
         if clean_number in self.cache:
             return {"kind": "found", "result": asdict(self.cache[clean_number])}
         result = query_number(self.client, clean_number)
-        if result.lookup_status == "Captcha required":
-            return self.new_captcha(clean_number)
         if result.lookup_status == "Found":
             self.save_result(result)
             return {"kind": "found", "result": asdict(result)}
+        message = "Endpoint lookup did not return a confirmed provider. Use the public form fallback, then save the visible provider here."
+        if result.lookup_status == "Captcha required":
+            message = "The Porting site requested verification. Open the public Porting form, complete the page there if needed, then save the visible provider here."
         return {
             "kind": "manual",
             "number": clean_number,
-            "formUrl": f"https://www.porting.co.za/PublicWebsiteApp/#/number-inquiry?sid=smppipd4x1&msisdn={clean_number}",
+            "formUrl": self.porting_lookup_url(clean_number),
             "result": asdict(result),
-            "message": "Endpoint lookup did not return a confirmed provider. Use the public form fallback, complete any captcha shown there, then save the visible provider here.",
+            "message": message,
         }
 
     def save_manual_result(self, clean_number: str, provider: str, raw_result: str = "") -> dict[str, Any]:
@@ -277,36 +357,6 @@ class CloudState:
             raw,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
-        self.save_result(result)
-        return {"kind": "found", "result": asdict(result)}
-
-    def new_captcha(self, clean_number: str) -> dict[str, Any]:
-        response = self.client.request("GET", "captcha/captcha-gen")
-        image_data = str(response.get("imageData") or "")
-        string_data = str(response.get("stringData") or "")
-        self.pending_captcha[clean_number] = {"captchaEncrypt": string_data}
-        return {
-            "kind": "captcha",
-            "number": clean_number,
-            "imageData": image_data,
-            "message": "Please type the captcha shown in the image.",
-        }
-
-    def submit_captcha(self, clean_number: str, code: str) -> dict[str, Any]:
-        pending = self.pending_captcha.get(clean_number)
-        if not pending:
-            return self.new_captcha(clean_number)
-        payload = {
-            "number": clean_number,
-            "captcha": code.strip(),
-            "captchaEncrypt": pending["captchaEncrypt"],
-            "puid": self.client.puid,
-        }
-        response = self.client.request("POST", "publicInquiry/submitRequest", payload)
-        result = parse_result(clean_number, response)
-        if result.lookup_status == "Captcha required":
-            return self.new_captcha(clean_number)
-        self.pending_captcha.pop(clean_number, None)
         self.save_result(result)
         return {"kind": "found", "result": asdict(result)}
 
@@ -354,6 +404,7 @@ class CloudState:
             "Telkom Service?",
             "Raw Result",
             "Checked At",
+            "Porting Lookup Link",
         ]
 
         wb = Workbook()
@@ -410,9 +461,13 @@ class CloudState:
             result.telkom,
             result.raw_result,
             result.checked_at,
+            self.porting_lookup_url(clean_number or result.clean_number),
         ]
         for offset, value in enumerate(export_values):
-            ws.cell(out_row, first_result_col + offset, value)
+            cell = ws.cell(out_row, first_result_col + offset, value)
+            if offset == len(export_values) - 1 and clean_number:
+                cell.hyperlink = value
+                cell.style = "Hyperlink"
         self.style_export_row(ws, out_row, first_result_col, result.telkom, len(export_values))
 
     @staticmethod
@@ -451,6 +506,7 @@ class CloudState:
             "Current Provider",
             "Raw Result",
             "Checked At",
+            "Porting Lookup Link",
         ]
         for col, value in enumerate(headers, start=1):
             cell = out_ws.cell(1, col, value)
@@ -478,9 +534,13 @@ class CloudState:
                     result.current_provider,
                     result.raw_result,
                     result.checked_at,
+                    self.porting_lookup_url(result.clean_number),
                 ]
                 for col, value in enumerate(values, start=1):
-                    out_ws.cell(out_row, col, value)
+                    cell = out_ws.cell(out_row, col, value)
+                    if col == len(values):
+                        cell.hyperlink = value
+                        cell.style = "Hyperlink"
                 out_row += 1
 
         for row in range(2, out_ws.max_row + 1):
@@ -541,8 +601,7 @@ PAGE = """
     .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
     .result { padding: 12px; border-radius: 6px; margin-top: 14px; background: #eef3ff; white-space: pre-wrap; }
     .yes { background: #d9ead3; } .no { background: #f4cccc; } .unknown { background: #ffe699; }
-    .captcha { display: none; margin-top: 14px; padding: 14px; border: 1px solid #d7b945; background: #fff7d6; border-radius: 8px; }
-    .captcha img { display: block; max-width: 260px; border: 1px solid #d0d0d0; background: white; margin-bottom: 10px; }
+    .manual { display: none; margin-top: 14px; padding: 14px; border: 1px solid #d7b945; background: #fff7d6; border-radius: 8px; }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
     th, td { text-align: left; border-bottom: 1px solid #e5e7eb; padding: 8px; vertical-align: top; }
     th { background: #eef2f7; }
@@ -555,7 +614,7 @@ PAGE = """
   <header>
     <div>
       <h1>Telkom Cloud Checker</h1>
-      <p>Upload Excel or CSV files, check 011, 012 and mobile numbers, complete captcha manually when requested, then export reports.</p>
+      <p>Upload Excel or CSV files, auto-check 011, 012 and mobile numbers, then export reports.</p>
     </div>
     <button class="secondary" id="exportBtn">Export Reports</button>
   </header>
@@ -564,6 +623,7 @@ PAGE = """
     <form action="/upload{% if key %}?key={{ key|urlencode }}{% endif %}" method="post" enctype="multipart/form-data">
       <div class="label">Upload .xlsx or .csv files</div>
       <input type="file" name="files" multiple accept=".xlsx,.csv">
+      <label style="display:inline-flex;gap:6px;align-items:center;margin:0 10px;"><input type="checkbox" name="auto_start" value="1" checked> Auto-check after upload</label>
       <button type="submit">Upload</button>
       <button class="danger" type="button" id="resetBtn">Reset Uploaded Files</button>
     </form>
@@ -578,19 +638,14 @@ PAGE = """
       <div><div class="label">File</div><div class="value" id="area"></div></div>
     </div>
     <div class="actions">
+      <button id="autoBtn">Auto Check Remaining</button>
+      <button class="secondary" id="stopAutoBtn">Stop Auto Check</button>
       <button id="checkBtn">Check This Number</button>
       <button class="secondary" id="formBtn">Open Porting Form</button>
       <button class="secondary" id="skipBtn">Skip For Now</button>
     </div>
-    <div class="captcha" id="captchaBox">
-      <div class="label">Captcha</div>
-      <img id="captchaImg" alt="Captcha">
-      <div class="actions">
-        <input id="captchaInput" autocomplete="off" placeholder="Type captcha code">
-        <button id="captchaBtn">Submit Captcha</button>
-      </div>
-    </div>
-    <div class="captcha" id="manualBox">
+    <div id="jobStatus" class="result"></div>
+    <div class="manual" id="manualBox">
       <div class="label">Manual form result</div>
       <div class="actions">
         <input id="manualProvider" autocomplete="off" placeholder="Provider, e.g. TELKOM or BACKSPACE">
@@ -636,10 +691,17 @@ function renderSummary(summary) {
     metric('011 rows', summary.joburg_rows), metric('012 rows', summary.tshwane_rows), metric('Mobile rows', summary.mobile_rows),
     metric('Non-Telkom', summary.non_telkom_rows)
   ].join('');
+  renderJob(summary.auto_job || {});
+}
+function renderJob(job) {
+  const box = document.getElementById('jobStatus');
+  const running = job.running ? 'Running' : 'Idle';
+  box.className = 'result ' + (job.blocked ? 'unknown' : '');
+  box.textContent = `Automatic checker: ${running}\\nChecked this run: ${job.checked_now || 0}\\nLast number: ${job.last_number || '-'}\\n${job.last_message || ''}`;
 }
 function renderCurrent(row) {
-  current = row; document.getElementById('captchaBox').style.display = 'none'; document.getElementById('manualBox').style.display = 'none';
-  document.getElementById('captchaInput').value = ''; document.getElementById('manualProvider').value = ''; document.getElementById('manualRaw').value = '';
+  current = row; document.getElementById('manualBox').style.display = 'none';
+  document.getElementById('manualProvider').value = ''; document.getElementById('manualRaw').value = '';
   if (!row) {
     document.getElementById('company').textContent = 'No unchecked row available';
     document.getElementById('number').textContent = ''; document.getElementById('numberType').textContent = ''; document.getElementById('area').textContent = '';
@@ -672,28 +734,23 @@ async function checkCurrent() {
   if (!current || busy) return; setBusy(true);
   try {
     const data = await api('/api/check', { number: current.clean_number });
-    if (data.kind === 'captcha') {
-      document.getElementById('captchaBox').style.display = 'block';
-      document.getElementById('captchaImg').src = 'data:image/jpeg;base64,' + data.imageData;
-      document.getElementById('result').textContent = data.message;
-      document.getElementById('captchaInput').focus();
-    } else if (data.kind === 'manual') {
+    if (data.kind === 'manual') {
       showManual(data);
     } else { showResult(data.result); await refresh(); }
   } finally { setBusy(false); }
 }
-async function submitCaptcha() {
-  if (!current || busy) return;
-  const code = document.getElementById('captchaInput').value.trim();
-  if (!code) return; setBusy(true);
+async function startAuto() {
+  if (busy) return; setBusy(true);
   try {
-    const data = await api('/api/captcha', { number: current.clean_number, code });
-    if (data.kind === 'captcha') {
-      document.getElementById('captchaImg').src = 'data:image/jpeg;base64,' + data.imageData;
-      document.getElementById('captchaInput').value = '';
-      document.getElementById('result').textContent = 'That code was not accepted. Try the new captcha.';
-      document.getElementById('captchaInput').focus();
-    } else { document.getElementById('captchaBox').style.display = 'none'; showResult(data.result); await refresh(); }
+    await api('/api/auto-start', {});
+    await refresh();
+  } finally { setBusy(false); }
+}
+async function stopAuto() {
+  if (busy) return; setBusy(true);
+  try {
+    await api('/api/auto-stop', {});
+    await refresh();
   } finally { setBusy(false); }
 }
 function openForm() {
@@ -717,10 +774,10 @@ async function saveManual() {
   } finally { setBusy(false); }
 }
 document.getElementById('checkBtn').addEventListener('click', checkCurrent);
+document.getElementById('autoBtn').addEventListener('click', startAuto);
+document.getElementById('stopAutoBtn').addEventListener('click', stopAuto);
 document.getElementById('formBtn').addEventListener('click', openForm);
-document.getElementById('captchaBtn').addEventListener('click', submitCaptcha);
 document.getElementById('manualBtn').addEventListener('click', saveManual);
-document.getElementById('captchaInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitCaptcha(); });
 document.getElementById('manualProvider').addEventListener('keydown', e => { if (e.key === 'Enter') saveManual(); });
 document.getElementById('skipBtn').addEventListener('click', refresh);
 document.getElementById('resetBtn').addEventListener('click', async () => { if (confirm('Remove uploaded files from this cloud app?')) { await api('/api/reset', {}); await refresh(); } });
@@ -733,6 +790,7 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
   } finally { setBusy(false); }
 });
 refresh();
+setInterval(refresh, 5000);
 </script>
 </body>
 </html>
@@ -755,6 +813,8 @@ def upload():
     for uploaded in files:
         if uploaded and uploaded.filename:
             STATE.add_upload(uploaded)
+    if request.form.get("auto_start") == "1":
+        STATE.start_auto_check()
     return redirect("/" + (f"?key={request.args.get('key')}" if request.args.get("key") else ""))
 
 
@@ -769,10 +829,14 @@ def api_check():
     return jsonify(STATE.check_number(str(data.get("number") or "")))
 
 
-@app.post("/api/captcha")
-def api_captcha():
-    data = request.get_json(force=True)
-    return jsonify(STATE.submit_captcha(str(data.get("number") or ""), str(data.get("code") or "")))
+@app.post("/api/auto-start")
+def api_auto_start():
+    return jsonify({"job": STATE.start_auto_check()})
+
+
+@app.post("/api/auto-stop")
+def api_auto_stop():
+    return jsonify({"job": STATE.stop_auto_check()})
 
 
 @app.post("/api/manual-result")
