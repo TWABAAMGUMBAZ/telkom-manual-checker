@@ -1,9 +1,15 @@
 services:
   - type: web
     name: telkom-manual-checker
-    env: python
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn render_app:app
+    healthCheckPath: /health
+    plan: free
     envVars:
+      - key: DATA_DIR
+        value: /tmp/telkom-render-checker
+      - key: SECRET_KEY
+        generateValue: true
       - key: APP_PASSWORD
-        value: Luna2023
+        generateValue: true
