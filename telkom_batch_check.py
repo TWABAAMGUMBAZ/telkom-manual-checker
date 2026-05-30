@@ -254,7 +254,11 @@ def query_number(client: CrdbClient, clean_number: str) -> LookupResult:
 def load_cache(path: Path) -> dict[str, LookupResult]:
     if not path.exists():
         return {}
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        path.unlink(missing_ok=True)
+        return {}
     cache: dict[str, LookupResult] = {}
     for number, result in raw.items():
         lookup = LookupResult(**result)
