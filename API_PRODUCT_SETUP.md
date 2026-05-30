@@ -100,3 +100,24 @@ The API reads the first sheet for Excel, or header row for CSV, extracts support
 ## Production Notes
 
 This API is now job-based and responsive, but the current lookup engine still depends on the public Porting flow. For a commercial resale API, replace the lookup engine with a licensed South African operator/porting data provider. The customer-facing endpoints can stay the same.
+
+## Field Planning Exports
+
+The web app exports three workbooks:
+
+- Full checked report per uploaded file.
+- `telkom_companies_only.xlsx` for confirmed Telkom-service rows.
+- `daily_visit_route_plan.xlsx` for field teams.
+
+The daily route plan adds:
+
+- Suggested visit order
+- Lead priority score
+- Hot/Warm/Cold priority
+- Visit area
+- Assigned rep
+- Visit status
+- Visit notes
+- Next action
+
+These columns are designed for physical telecom field teams that need to decide which clients to visit first and how to structure the day.
